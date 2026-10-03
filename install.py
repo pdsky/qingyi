@@ -15,7 +15,8 @@ desktop = home / '.local/share/applications/io.local.Qingyi.desktop'
 launcher = home / '.local/bin/qingyi'
 base = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/'
 entries = [('qingyi-selection/', '轻译：划词翻译', '<Alt>q', '--selection'),
-           ('qingyi-clipboard/', '轻译：复制翻译', '<Alt><Shift>q', '--clipboard')]
+           ('qingyi-clipboard/', '轻译：复制翻译', '<Alt><Shift>q', '--clipboard'),
+           ('qingyi-screenshot/', '轻译：截图翻译', '<Alt>s', '--screenshot')]
 media = Gio.Settings.new('org.gnome.settings-daemon.plugins.media-keys')
 paths = list(media.get_strv('custom-keybindings'))
 
@@ -86,7 +87,11 @@ app_dir.mkdir(parents=True, exist_ok=True)
 launcher.parent.mkdir(parents=True, exist_ok=True)
 desktop.parent.mkdir(parents=True, exist_ok=True)
 source = Path(__file__).resolve().parent
-for name in ('qingyi.py', 'ai_backend.py', 'preferences.py', 'chat_panel.py', 'install.py', 'README.md'):
+if '--with-ocr' in sys.argv:
+    from setup_ocr import install_ocr
+    install_ocr(app_dir)
+for name in ('qingyi.py', 'ai_backend.py', 'preferences.py', 'chat_panel.py', 'screenshot.py',
+             'setup_ocr.py', 'install.py', 'README.md'):
     if (source / name).resolve() != (app_dir / name).resolve():
         shutil.copy2(source / name, app_dir / name)
 if (source / 'assets').resolve() != (app_dir / 'assets').resolve():
@@ -100,7 +105,7 @@ Version=1.0
 Type=Application
 Name=轻译
 Name[en]=Qingyi Translator
-Comment=划词翻译、AI 总结与小黑阅读助手
+Comment=划词与截图翻译、AI 总结与小黑阅读助手
 Exec={launcher}
 Icon={app_dir / 'assets/black-cat.svg'}
 Terminal=false
@@ -108,7 +113,7 @@ Categories=Utility;
 Keywords=翻译;划词;translate;translation;
 StartupNotify=true
 StartupWMClass=io.local.Qingyi
-Actions=Selection;Clipboard;Quit;
+Actions=Selection;Clipboard;Screenshot;Quit;
 
 [Desktop Action Selection]
 Name=翻译选中文字
@@ -117,6 +122,10 @@ Exec={launcher} --selection
 [Desktop Action Clipboard]
 Name=翻译剪贴板
 Exec={launcher} --clipboard
+
+[Desktop Action Screenshot]
+Name=截图翻译
+Exec={launcher} --screenshot
 
 [Desktop Action Quit]
 Name=退出轻译
@@ -134,4 +143,4 @@ Gio.Settings.sync()
 update_database = shutil.which('update-desktop-database')
 if update_database:
     subprocess.run([update_database, str(desktop.parent)], check=False)
-print('已安装轻译。Alt+Q：划词翻译；Alt+Shift+Q：复制翻译。')
+print('已安装轻译。Alt+Q：划词翻译；Alt+Shift+Q：复制翻译；Alt+S：截图翻译。')

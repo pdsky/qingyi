@@ -9,9 +9,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from ai_backend import ModelSettings, summarize, Cancelled, MAX_SUMMARY_TEXT
+from ai_backend import ModelSettings, summarize, translate_with_model, Cancelled, MAX_SUMMARY_TEXT
 from preferences import ModelWindow
 from chat_panel import ChatPanel
+from screenshot import screenshot_text
 
 MAX_TEXT = 5000
 APP_ID = 'io.local.Qingyi'
@@ -56,7 +57,7 @@ def translate(text, target='zh-CN'):
 def friendly_error(exc):
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code == 429:
-            return '请求过于频繁，请稍等片刻再试。'
+            return 'Google 翻译限流。可勾选「翻译也用所选 AI 模型」后重试，或稍后再试。'
         return f'翻译服务暂时不可用（HTTP {exc.code}），请稍后重试。'
     if isinstance(exc, (urllib.error.URLError, TimeoutError, socket.timeout)):
         return '连接翻译服务失败，请检查网络后重试，或点击「网页翻译」。'
@@ -85,6 +86,7 @@ def main():
             self.mode = 'translate'
             self.workers = []
             self.chat = None
+            self.screenshot_busy = False
 
         def do_shutdown(self):
             if self.cancel_event:
@@ -155,6 +157,8 @@ def main():
             elif args and args[0] == '--chat':
                 self.show_window()
                 self.chat.input.grab_focus()
+            elif args and args[0] == '--screenshot':
+                self.begin_screenshot()
             elif args and args[0] in ('--selection', '--clipboard'):
                 self.read_selection(args[0] == '--clipboard')
             elif args and args[0] == '--text':
@@ -212,13 +216,17 @@ def main():
             self.language.connect('notify::selected', self.on_language)
             top.append(self.language)
             root.append(top)
-            hint = Gtk.Label(label='选中文字 Alt+Q  ·  复制后 Alt+Shift+Q', xalign=0)
+            hint = Gtk.Label(label='划词 Alt+Q  ·  复制 Alt+Shift+Q  ·  截图 Alt+S', xalign=0)
             hint.add_css_class('hint')
             root.append(hint)
             self.model_button = Gtk.Button(halign=Gtk.Align.START, css_classes=['model-button'])
             self.model_button.connect('clicked', self.open_settings)
             root.append(self.model_button)
             self.update_model_label()
+            self.ai_translation = Gtk.CheckButton(label='翻译也用所选 AI 模型')
+            self.ai_translation.set_tooltip_text('勾选后，翻译与截图翻译使用所选模型及其额度；不勾选使用 Google')
+            self.ai_translation.connect('toggled', self.translation_engine_changed)
+            root.append(self.ai_translation)
             root.append(Gtk.Label(label='原文 · 自动识别语言', xalign=0, css_classes=['section']))
             self.source = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
             self.source.add_css_class('source')
@@ -228,13 +236,18 @@ def main():
             src_scroll.set_child(self.source)
             root.append(src_scroll)
             controls = Gtk.Box(spacing=8)
-            self.translate_button = Gtk.Button(label='翻译  Ctrl+Enter', css_classes=['suggested-action'])
+            self.translate_button = Gtk.Button(label='翻译', css_classes=['suggested-action'])
+            self.translate_button.set_tooltip_text('翻译原文 · Ctrl+Enter')
             self.translate_button.connect('clicked', lambda *_: self.begin_translation())
             controls.append(self.translate_button)
             self.summary_button = Gtk.Button(label='总结', css_classes=['suggested-action'])
             self.summary_button.set_tooltip_text('用所选模型生成概述和要点 · Ctrl+Shift+Enter')
             self.summary_button.connect('clicked', lambda *_: self.begin_summary())
             controls.append(self.summary_button)
+            self.screenshot_button = Gtk.Button(label='截图翻译')
+            self.screenshot_button.set_tooltip_text('框选屏幕文字，自动识别并翻译 · Alt+S · Esc 取消框选')
+            self.screenshot_button.connect('clicked', lambda *_: self.begin_screenshot())
+            controls.append(self.screenshot_button)
             paste = Gtk.Button(label='粘贴')
             paste.connect('clicked', lambda *_: self.read_selection(True))
             controls.append(paste)
@@ -263,7 +276,7 @@ def main():
             self.status = Gtk.Label(label='选中文字后按 Alt+Q，也可以直接输入原文。', xalign=0, wrap=True)
             self.status.add_css_class('notice')
             root.append(self.status)
-            privacy = Gtk.Label(label='翻译：Google · 总结与聊天：所选模型 · 不保存历史',
+            privacy = Gtk.Label(label='截图本机识别 · 仅发送文字 · 不保存历史',
                                 xalign=0, wrap=True)
             privacy.add_css_class('hint')
             root.append(privacy)
@@ -370,8 +383,79 @@ def main():
         def begin_summary(self):
             self.begin_action('summary')
 
+        def begin_screenshot(self):
+            if self.screenshot_busy:
+                return
+            if self.win is None:
+                self.build_window()
+            self.request_id += 1
+            if self.reader:
+                self.reader.cancel()
+            self.cancel_job()
+            self.cancel_event = threading.Event()
+            cancel = self.cancel_event
+            serial = self.serial
+            self.screenshot_busy = True
+            self.screenshot_button.set_sensitive(False)
+            self.status.set_text('拖动框选要翻译的文字 · 松开鼠标开始识别 · Esc 取消')
+            # Hide without close-request: the chat and previous draft survive.
+            self.win.set_visible(False)
+            self.hold()
+
+            def progress():
+                GLib.idle_add(self.screenshot_progress, serial)
+
+            def worker():
+                text, error, canceled = '', None, False
+                try:
+                    if cancel.wait(.3):
+                        raise Cancelled()
+                    text = screenshot_text(cancel, progress)
+                except Cancelled:
+                    canceled = True
+                except Exception as exc:
+                    error = str(exc)
+                GLib.idle_add(self.screenshot_complete, serial, text, error, canceled)
+
+            thread = threading.Thread(target=worker, daemon=True)
+            self.workers = [old for old in self.workers if old.is_alive()]
+            self.workers.append(thread)
+            thread.start()
+
+        def screenshot_progress(self, serial):
+            if serial == self.serial:
+                self.show_window()
+                self.status.set_text('正在识别截图文字…')
+                self.status.remove_css_class('error')
+                self.spinner.start()
+                self.cancel_button.set_visible(True)
+            return False
+
+        def screenshot_complete(self, serial, text, error, canceled):
+            self.screenshot_busy = False
+            self.screenshot_button.set_sensitive(True)
+            self.release()
+            if serial != self.serial:
+                return False
+            self.show_window()
+            self.spinner.stop()
+            self.cancel_button.set_visible(False)
+            if canceled:
+                self.status.set_text('已取消截图 · 原文和结果仍保留')
+            elif error:
+                self.status.set_text(error)
+                self.status.add_css_class('error')
+            else:
+                self.set_source(text)
+                if len(text) > MAX_TEXT:
+                    self.status.set_text(f'已识别 {len(text)} 字 · 超过翻译上限 {MAX_TEXT} 字，可缩短原文或点击总结')
+                else:
+                    self.begin_translation()
+            return False
+
         def begin_action(self, mode):
             text = self.source_text()
+            use_ai = mode == 'translate' and self.ai_translation.get_active()
             if self.cancel_event:
                 self.cancel_event.set()
             self.cancel_event = threading.Event()
@@ -380,7 +464,7 @@ def main():
             serial = self.serial
             self.mode = mode
             limit = MAX_SUMMARY_TEXT if mode == 'summary' else MAX_TEXT
-            self.output_title.set_text('总结 · 概述与要点' if mode == 'summary' else '译文')
+            self.output_title.set_text('总结 · 概述与要点' if mode == 'summary' else ('译文 · AI 模型' if use_ai else '译文'))
             self.copy_button.set_label('复制总结' if mode == 'summary' else '复制译文')
             if not text or len(text) > limit:
                 self.result = ''
@@ -396,7 +480,7 @@ def main():
             self.output.get_buffer().set_text('')
             self.copy_button.set_sensitive(False)
             self.status.remove_css_class('error')
-            self.status.set_text('正在总结…' if mode == 'summary' else '正在翻译…')
+            self.status.set_text('正在总结…' if mode == 'summary' else ('正在用所选模型翻译…' if use_ai else '正在翻译…'))
             self.translate_button.set_sensitive(mode != 'translate')
             self.summary_button.set_sensitive(mode != 'summary')
             self.cancel_button.set_visible(True)
@@ -406,16 +490,17 @@ def main():
 
             def worker():
                 try:
-                    if mode == 'summary':
+                    if mode == 'summary' or use_ai:
                         key = '' if config['provider'] == 'codex' else self.model_settings.get_key(config['base_url'])
-                        translated = summarize(text, target, config, key, cancel)
+                        action = summarize if mode == 'summary' else translate_with_model
+                        translated = action(text, target, config, key, cancel)
                     else:
                         translated = translate(text, target)
                     error = None
                 except Cancelled:
                     return
                 except Exception as exc:
-                    translated, error = '', str(exc) if mode == 'summary' else friendly_error(exc)
+                    translated, error = '', str(exc) if mode == 'summary' or use_ai else friendly_error(exc)
                 GLib.idle_add(self.complete, serial, translated, error)
 
             thread = threading.Thread(target=worker, daemon=True)
@@ -442,12 +527,12 @@ def main():
 
         def on_language(self, *_):
             if self.source_text():
-                if self.mode == 'summary':
+                if self.mode == 'summary' or self.ai_translation.get_active():
                     self.cancel_job()
                     self.result = ''
                     self.output.get_buffer().set_text('')
                     self.copy_button.set_sensitive(False)
-                    self.status.set_text('输出语言已切换 · 点击「总结」重新生成')
+                    self.status.set_text('输出语言已切换 · 点击「总结」或「翻译」重新生成')
                 else:
                     self.begin_translation()
 
@@ -455,6 +540,11 @@ def main():
             if self.result:
                 Gdk.Display.get_default().get_clipboard().set_text(self.result)
                 self.status.set_text('总结已复制。' if self.mode == 'summary' else '译文已复制。')
+
+        def translation_engine_changed(self, *_):
+            if self.mode == 'translate' and not self.screenshot_busy:
+                self.cancel_job()
+            self.status.set_text('已切换翻译方式 · 点击「翻译」或重新截图；AI 翻译使用所选模型的额度')
 
         def cancel_job(self, *_):
             self.serial += 1
@@ -485,7 +575,7 @@ def main():
             self.settings_window.present()
 
         def model_changed(self):
-            if self.mode == 'summary':
+            if self.mode == 'summary' or self.ai_translation.get_active():
                 self.cancel_job()
                 self.result = ''
                 self.output.get_buffer().set_text('')
