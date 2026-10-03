@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.log
+models.json
+auth.json
+.config/
+.DS_Store
+work/
