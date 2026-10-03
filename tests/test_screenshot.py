@@ -13,6 +13,37 @@ from ai_backend import Cancelled
 
 
 class ScreenshotTests(unittest.TestCase):
+    def test_regions_preserve_paragraph_positions_and_line_order(self):
+        header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+        rows = ['5\t1\t1\t1\t1\t1\t10\t20\t40\t15\t90\tHello',
+                '5\t1\t1\t1\t1\t2\t55\t20\t40\t15\t90\tworld',
+                '5\t1\t1\t1\t2\t1\t10\t40\t55\t15\t90\tAgain',
+                '5\t1\t2\t1\t1\t1\t120\t20\t20\t15\t90\t截图',
+                '5\t1\t2\t1\t1\t2\t140\t20\t20\t15\t90\t翻译']
+        regions = screenshot.parse_regions(header + '\n'.join(rows), 200, 100)
+        self.assertEqual(regions[0], screenshot.TextRegion(10, 20, 85, 35, 'Hello world\nAgain'))
+        self.assertEqual(regions[1].text, '截图翻译')
+        self.assertEqual(regions[1].x, 120)
+
+    def test_invalid_regions_are_rejected_and_edges_clipped(self):
+        header = 'level\tpage_num\tblock_num\tpar_num\tline_num\tleft\ttop\twidth\theight\ttext\n'
+        with self.assertRaises(screenshot.ScreenshotError):
+            screenshot.parse_regions(header + '5\t1\t1\t1\t1\tbad\t0\t20\t20\tword', 100, 100)
+        clipped = screenshot.parse_regions(header + '5\t1\t1\t1\t1\t-5\t90\t25\t20\tword', 100, 100)[0]
+        self.assertEqual((clipped.x, clipped.y, clipped.width, clipped.height), (0, 90, 20, 10))
+
+    def test_region_ocr_removes_private_image_on_failure(self):
+        paths = []
+        def engine(args, *_):
+            paths.append(Path(args[1]))
+            self.assertEqual(paths[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(args[-1], 'tsv')
+            raise Cancelled()
+        with patch('screenshot.ocr_runtime', return_value=('engine', {})), patch('screenshot.run_process', side_effect=engine):
+            with self.assertRaises(Cancelled):
+                screenshot.recognize_regions(screenshot.PNG_HEADER, 100, 100, threading.Event())
+        self.assertFalse(paths[0].parent.exists())
+
     def test_capture_only_selected_crop_without_clipboard_or_upload(self):
         cancel = threading.Event()
         png = screenshot.PNG_HEADER + b'test fixture'

@@ -90,7 +90,7 @@ source = Path(__file__).resolve().parent
 if '--with-ocr' in sys.argv:
     from setup_ocr import install_ocr
     install_ocr(app_dir)
-for name in ('qingyi.py', 'ai_backend.py', 'preferences.py', 'chat_panel.py', 'screenshot.py',
+for name in ('qingyi.py', 'ai_backend.py', 'preferences.py', 'chat_panel.py', 'screenshot.py', 'screenshot_window.py',
              'setup_ocr.py', 'install.py', 'README.md'):
     if (source / name).resolve() != (app_dir / name).resolve():
         shutil.copy2(source / name, app_dir / name)

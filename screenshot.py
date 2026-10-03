@@ -1,5 +1,8 @@
 """Local screenshot selection and OCR. Images never go to a web service."""
 import os
+import csv
+from dataclasses import dataclass
+import io
 from pathlib import Path
 import re
 import shutil
@@ -14,6 +17,54 @@ PNG_HEADER = b'\x89PNG\r\n\x1a\n'
 
 class ScreenshotError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class TextRegion:
+    x: int
+    y: int
+    width: int
+    height: int
+    text: str
+
+
+def clean_text(text):
+    text = re.sub(r'(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff，。！？；：、])', '', text)
+    return re.sub(r'(?<=[，。！？；：、])[ \t]+(?=[\u4e00-\u9fff])', '', text).strip()
+
+
+def parse_regions(tsv, width, height):
+    paragraphs = {}
+    for row in csv.DictReader(io.StringIO(tsv), delimiter='\t'):
+        if row.get('level') != '5' or not row.get('text', '').strip():
+            continue
+        try:
+            key = tuple(int(row[name]) for name in ('page_num', 'block_num', 'par_num'))
+            line = int(row['line_num'])
+            x, y, w, h = [int(row[name]) for name in ('left', 'top', 'width', 'height')]
+        except (KeyError, TypeError, ValueError):
+            continue
+        left, top, right, bottom = max(0, x), max(0, y), min(width, x + w), min(height, y + h)
+        if right <= left or bottom <= top:
+            continue
+        paragraph = paragraphs.setdefault(key, {'words': [], 'boxes': []})
+        paragraph['words'].append((line, row['text'].strip()))
+        paragraph['boxes'].append((left, top, right, bottom))
+    regions = []
+    for paragraph in paragraphs.values():
+        lines = {}
+        for line, word in paragraph['words']:
+            lines.setdefault(line, []).append(word)
+        text = clean_text('\n'.join(' '.join(words) for words in lines.values()))
+        boxes = paragraph['boxes']
+        x, y = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        right, bottom = max(b[2] for b in boxes), max(b[3] for b in boxes)
+        regions.append(TextRegion(x, y, right - x, bottom - y, text))
+    if not regions:
+        raise ScreenshotError('没有找到清晰的文字，请放大页面后重新框选。')
+    if len(regions) > 80 or sum(len(region.text) for region in regions) > 5000:
+        raise ScreenshotError('截图文字较多，请缩小框选区域后重试。')
+    return regions
 
 
 def run_process(args, cancel, timeout, env=None, input_data=None):
@@ -109,8 +160,7 @@ def recognize(image, cancel, runtime=None):
     if code:
         raise ScreenshotError('文字识别失败，请重新截取清晰的文字区域。')
     text = output.decode('utf-8', 'replace').strip()
-    text = re.sub(r'(?<=[\u4e00-\u9fff])[ \t]+(?=[\u4e00-\u9fff，。！？；：、])', '', text)
-    text = re.sub(r'(?<=[，。！？；：、])[ \t]+(?=[\u4e00-\u9fff])', '', text)
+    text = clean_text(text)
     if not text:
         raise ScreenshotError('没有识别到文字。请放大页面后重新框选。')
     return text
@@ -122,3 +172,19 @@ def screenshot_text(cancel, progress=None):
     if progress:
         progress()
     return recognize(image, cancel, runtime)
+
+
+def recognize_regions(image, width, height, cancel):
+    binary, env = ocr_runtime()
+    if not image.startswith(PNG_HEADER):
+        raise ScreenshotError('截图不是有效的 PNG 图片。')
+    with tempfile.TemporaryDirectory(prefix='qingyi-ocr-', dir=os.environ.get('XDG_RUNTIME_DIR')) as folder:
+        path = Path(folder) / 'selection.png'
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'wb') as file:
+            file.write(image)
+        code, output, _ = run_process([binary, str(path), 'stdout', '-l', 'eng+chi_sim',
+                                      '--psm', '3', 'tsv'], cancel, 60, env)
+    if code:
+        raise ScreenshotError('文字定位失败，请重新截取清晰的文字区域。')
+    return parse_regions(output.decode('utf-8', 'replace'), width, height)

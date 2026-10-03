@@ -12,7 +12,8 @@ import urllib.request
 from ai_backend import ModelSettings, summarize, translate_with_model, Cancelled, MAX_SUMMARY_TEXT
 from preferences import ModelWindow
 from chat_panel import ChatPanel
-from screenshot import screenshot_text
+from screenshot import capture, check_tools
+from screenshot_window import ScreenshotWindow
 
 MAX_TEXT = 5000
 APP_ID = 'io.local.Qingyi'
@@ -87,12 +88,16 @@ def main():
             self.workers = []
             self.chat = None
             self.screenshot_busy = False
+            self.screenshot_window = None
+            self.screenshot_use_ai = None
 
         def do_shutdown(self):
             if self.cancel_event:
                 self.cancel_event.set()
             if self.chat and self.chat.cancel_event:
                 self.chat.cancel_event.set()
+            if self.screenshot_window and self.screenshot_window.cancel_event:
+                self.screenshot_window.cancel_event.set()
             deadline = time.monotonic() + 3
             for worker in self.workers:
                 if worker.is_alive():
@@ -170,6 +175,8 @@ def main():
                 try:
                     draft = json.loads(Path(args[1]).read_text())
                     self.set_source(str(draft.get('source', '')))
+                    if isinstance(draft.get('use_ai'), bool):
+                        self.ai_translation.set_active(draft['use_ai'])
                     result = draft.get('result', '')
                     if isinstance(result, str) and result:
                         self.result = result
@@ -245,7 +252,7 @@ def main():
             self.summary_button.connect('clicked', lambda *_: self.begin_summary())
             controls.append(self.summary_button)
             self.screenshot_button = Gtk.Button(label='截图翻译')
-            self.screenshot_button.set_tooltip_text('框选屏幕文字，自动识别并翻译 · Alt+S · Esc 取消框选')
+            self.screenshot_button.set_tooltip_text('框选画面，在截图原位置显示译文 · Alt+S · Esc 取消框选')
             self.screenshot_button.connect('clicked', lambda *_: self.begin_screenshot())
             controls.append(self.screenshot_button)
             paste = Gtk.Button(label='粘贴')
@@ -397,60 +404,59 @@ def main():
             serial = self.serial
             self.screenshot_busy = True
             self.screenshot_button.set_sensitive(False)
-            self.status.set_text('拖动框选要翻译的文字 · 松开鼠标开始识别 · Esc 取消')
+            self.status.set_text('拖动框选画面 · 松开鼠标后在截图上显示译文 · Esc 取消')
             # Hide without close-request: the chat and previous draft survive.
             self.win.set_visible(False)
+            self.screenshot_previous_visible = bool(self.screenshot_window and self.screenshot_window.get_visible())
+            if self.screenshot_window:
+                self.screenshot_window.set_visible(False)
             self.hold()
 
-            def progress():
-                GLib.idle_add(self.screenshot_progress, serial)
-
             def worker():
-                text, error, canceled = '', None, False
+                image, error, canceled = b'', None, False
                 try:
                     if cancel.wait(.3):
                         raise Cancelled()
-                    text = screenshot_text(cancel, progress)
+                    check_tools(cancel)
+                    image = capture(cancel)
                 except Cancelled:
                     canceled = True
                 except Exception as exc:
                     error = str(exc)
-                GLib.idle_add(self.screenshot_complete, serial, text, error, canceled)
+                GLib.idle_add(self.screenshot_complete, serial, image, error, canceled)
 
             thread = threading.Thread(target=worker, daemon=True)
             self.workers = [old for old in self.workers if old.is_alive()]
             self.workers.append(thread)
             thread.start()
 
-        def screenshot_progress(self, serial):
-            if serial == self.serial:
-                self.show_window()
-                self.status.set_text('正在识别截图文字…')
-                self.status.remove_css_class('error')
-                self.spinner.start()
-                self.cancel_button.set_visible(True)
-            return False
-
-        def screenshot_complete(self, serial, text, error, canceled):
+        def screenshot_complete(self, serial, image, error, canceled):
             self.screenshot_busy = False
             self.screenshot_button.set_sensitive(True)
             self.release()
             if serial != self.serial:
                 return False
-            self.show_window()
             self.spinner.stop()
             self.cancel_button.set_visible(False)
-            if canceled:
-                self.status.set_text('已取消截图 · 原文和结果仍保留')
-            elif error:
-                self.status.set_text(error)
-                self.status.add_css_class('error')
+            if not canceled and not error:
+                try:
+                    window = ScreenshotWindow(self, image)
+                    if self.screenshot_window:
+                        self.screenshot_window.close()
+                    self.screenshot_window = window
+                    window.present()
+                    window.begin()
+                    self.status.set_text('已打开截图画面 · 译文在截图窗口中显示 · 主窗口内容保留')
+                    return False
+                except Exception as exc:
+                    error = str(exc)
+            if self.screenshot_window and self.screenshot_previous_visible:
+                self.screenshot_window.present()
             else:
-                self.set_source(text)
-                if len(text) > MAX_TEXT:
-                    self.status.set_text(f'已识别 {len(text)} 字 · 超过翻译上限 {MAX_TEXT} 字，可缩短原文或点击总结')
-                else:
-                    self.begin_translation()
+                self.show_window()
+            self.status.set_text('已取消截图 · 原文和结果仍保留' if canceled else error)
+            if error:
+                self.status.add_css_class('error')
             return False
 
         def begin_action(self, mode):
@@ -542,6 +548,7 @@ def main():
                 self.status.set_text('总结已复制。' if self.mode == 'summary' else '译文已复制。')
 
         def translation_engine_changed(self, *_):
+            self.screenshot_use_ai = self.ai_translation.get_active()
             if self.mode == 'translate' and not self.screenshot_busy:
                 self.cancel_job()
             self.status.set_text('已切换翻译方式 · 点击「翻译」或重新截图；AI 翻译使用所选模型的额度')
@@ -582,6 +589,9 @@ def main():
                 self.copy_button.set_sensitive(False)
             if self.chat and self.chat.busy:
                 self.chat.cancel()
+            if self.screenshot_window:
+                self.screenshot_window.cancel()
+                self.screenshot_window.update_model_label()
             self.update_model_label()
             self.status.set_text('模型设置已保存 · 总结和提问将使用新模型')
 
